@@ -67,3 +67,9 @@ next-env.d.ts
 
 # ignore adding self-signed certs
 certs/
+
+# Local output (wiki cache, batch jobs)
+output/
+
+# Generated wiki export files in root
+*_wiki_*.md

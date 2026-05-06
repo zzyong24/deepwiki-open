@@ -116,6 +116,7 @@ class WikiExportRequest(BaseModel):
     repo_url: str = Field(..., description="URL of the repository")
     pages: List[WikiPage] = Field(..., description="List of wiki pages to export")
     format: Literal["markdown", "json"] = Field(..., description="Export format (markdown or json)")
+    wiki_structure: Optional[WikiStructureModel] = Field(None, description="Wiki structure for hierarchical TOC")
 
 # --- Model Configuration Models ---
 class Model(BaseModel):
@@ -247,7 +248,7 @@ async def export_wiki(request: WikiExportRequest):
 
         if request.format == "markdown":
             # Generate Markdown content
-            content = generate_markdown_export(request.repo_url, request.pages)
+            content = generate_markdown_export(request.repo_url, request.pages, request.wiki_structure)
             filename = f"{repo_name}_wiki_{timestamp}.md"
             media_type = "text/markdown"
         else:  # JSON format
@@ -319,49 +320,101 @@ async def get_local_repo_structure(path: str = Query(None, description="Path to 
             content={"error": f"Error processing local repository: {str(e)}"}
         )
 
-def generate_markdown_export(repo_url: str, pages: List[WikiPage]) -> str:
+def generate_markdown_export(repo_url: str, pages: List[WikiPage], wiki_structure: Optional['WikiStructureModel'] = None) -> str:
     """
-    Generate Markdown export of wiki pages.
-
-    Args:
-        repo_url: The repository URL
-        pages: List of wiki pages
-
-    Returns:
-        Markdown content as string
+    Generate Markdown export of wiki pages with hierarchical TOC if sections are available.
+    Also strips <think>...</think> reasoning blocks from content.
     """
+    import re
+
+    def strip_think(text: str) -> str:
+        return re.sub(r'<think>[\s\S]*?</think>', '', text, flags=re.IGNORECASE).strip()
+
     # Start with metadata
     markdown = f"# Wiki Documentation for {repo_url}\n\n"
     markdown += f"Generated on: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n\n"
 
-    # Add table of contents
-    markdown += "## Table of Contents\n\n"
-    for page in pages:
-        markdown += f"- [{page.title}](#{page.id})\n"
-    markdown += "\n"
+    # Build a page id → page lookup
+    page_by_id = {p.id: p for p in pages}
 
-    # Add each page
+    # ── Table of Contents ──────────────────────────────────────────
+    markdown += "## Table of Contents\n\n"
+
+    sections = wiki_structure.sections if wiki_structure and wiki_structure.sections else []
+    root_sections = wiki_structure.rootSections if wiki_structure and wiki_structure.rootSections else []
+
+    if sections and root_sections:
+        # Hierarchical TOC using sections
+        section_by_id = {s.id: s for s in sections}
+        pages_in_sections: set = set()
+
+        def render_section_toc(sec_id: str, depth: int = 0) -> str:
+            sec = section_by_id.get(sec_id)
+            if not sec:
+                return ''
+            indent = '  ' * depth
+            out = f"{indent}**{sec.title}**\n"
+            for pid in (sec.pages or []):
+                p = page_by_id.get(pid)
+                if p:
+                    out += f"{indent}  - [{p.title}](#{pid})\n"
+                    pages_in_sections.add(pid)
+            for sub_id in (sec.subsections or []):
+                out += render_section_toc(sub_id, depth + 1)
+            return out
+
+        for root_id in root_sections:
+            markdown += render_section_toc(root_id)
+        markdown += '\n'
+
+        # Append orphan pages (not in any section)
+        orphans = [p for p in pages if p.id not in pages_in_sections]
+        if orphans:
+            markdown += "**其他页面**\n"
+            for p in orphans:
+                markdown += f"  - [{p.title}](#{p.id})\n"
+            markdown += '\n'
+    else:
+        # Flat TOC — try to infer groups from importance
+        high = [p for p in pages if p.importance == 'high']
+        medium = [p for p in pages if p.importance == 'medium']
+        low = [p for p in pages if p.importance == 'low']
+
+        if high:
+            markdown += "**核心**\n"
+            for p in high:
+                markdown += f"  - [{p.title}](#{p.id})\n"
+        if medium:
+            markdown += "**详细**\n"
+            for p in medium:
+                markdown += f"  - [{p.title}](#{p.id})\n"
+        if low:
+            markdown += "**补充**\n"
+            for p in low:
+                markdown += f"  - [{p.title}](#{p.id})\n"
+        if not (high or medium or low):
+            for p in pages:
+                markdown += f"- [{p.title}](#{p.id})\n"
+        markdown += '\n'
+
+    # ── Page content ───────────────────────────────────────────────
     for page in pages:
         markdown += f"<a id='{page.id}'></a>\n\n"
         markdown += f"## {page.title}\n\n"
 
-
-
         # Add related pages
-        if page.relatedPages and len(page.relatedPages) > 0:
-            markdown += "### Related Pages\n\n"
+        if page.relatedPages:
             related_titles = []
             for related_id in page.relatedPages:
-                # Find the title of the related page
-                related_page = next((p for p in pages if p.id == related_id), None)
+                related_page = page_by_id.get(related_id)
                 if related_page:
                     related_titles.append(f"[{related_page.title}](#{related_id})")
-
             if related_titles:
-                markdown += "Related topics: " + ", ".join(related_titles) + "\n\n"
+                markdown += "> **相关页面**: " + " · ".join(related_titles) + "\n\n"
 
-        # Add page content
-        markdown += f"{page.content}\n\n"
+        # Strip think blocks then add content
+        clean_content = strip_think(page.content)
+        markdown += f"{clean_content}\n\n"
         markdown += "---\n\n"
 
     return markdown
@@ -393,16 +446,22 @@ def generate_json_export(repo_url: str, pages: List[WikiPage]) -> str:
 # Import the simplified chat implementation
 from api.simple_chat import chat_completions_stream
 from api.websocket_wiki import handle_websocket_chat
+from api.batch_wiki import router as batch_router
 
 # Add the chat_completions_stream endpoint to the main app
 app.add_api_route("/chat/completions/stream", chat_completions_stream, methods=["POST"])
 
 # Add the WebSocket endpoint
-app.add_websocket_route("/ws/chat", handle_websocket_chat)
+app.add_api_websocket_route("/ws/chat", handle_websocket_chat)
+
+# Add batch wiki generation router
+app.include_router(batch_router)
 
 # --- Wiki Cache Helper Functions ---
 
-WIKI_CACHE_DIR = os.path.join(get_adalflow_default_root_path(), "wikicache")
+# Store wiki cache under the project's output/ directory instead of ~/.adalflow/
+_PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+WIKI_CACHE_DIR = os.path.join(_PROJECT_ROOT, "output", "wikicache")
 os.makedirs(WIKI_CACHE_DIR, exist_ok=True)
 
 def get_wiki_cache_path(owner: str, repo: str, repo_type: str, language: str) -> str:

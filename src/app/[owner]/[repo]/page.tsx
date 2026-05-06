@@ -545,7 +545,7 @@ Remember:
         try {
           // Create WebSocket URL from the server base URL
           const serverBaseUrl = process.env.SERVER_BASE_URL || 'http://localhost:8001';
-          const wsBaseUrl = serverBaseUrl.replace(/^http/, 'ws')? serverBaseUrl.replace(/^https/, 'wss'): serverBaseUrl.replace(/^http/, 'ws');
+          const wsBaseUrl = serverBaseUrl.startsWith('https') ? serverBaseUrl.replace(/^https/, 'wss') : serverBaseUrl.replace(/^http/, 'ws');
           const wsUrl = `${wsBaseUrl}/ws/chat`;
 
           // Create a new WebSocket connection
@@ -643,6 +643,9 @@ Remember:
 
         // Clean up markdown delimiters
         content = content.replace(/^```markdown\s*/i, '').replace(/```\s*$/i, '');
+
+        // Strip <think>...</think> blocks (emitted by reasoning models like MiniMax-M2.7)
+        content = content.replace(/<think>[\s\S]*?<\/think>/gi, '').trim();
 
         console.log(`Received content for ${page.title}, length: ${content.length} characters`);
 
@@ -842,7 +845,7 @@ IMPORTANT:
       try {
         // Create WebSocket URL from the server base URL
         const serverBaseUrl = process.env.SERVER_BASE_URL || 'http://localhost:8001';
-        const wsBaseUrl = serverBaseUrl.replace(/^http/, 'ws')? serverBaseUrl.replace(/^https/, 'wss'): serverBaseUrl.replace(/^http/, 'ws');
+        const wsBaseUrl = serverBaseUrl.startsWith('https') ? serverBaseUrl.replace(/^https/, 'wss') : serverBaseUrl.replace(/^http/, 'ws');
         const wsUrl = `${wsBaseUrl}/ws/chat`;
 
         // Create a new WebSocket connection
@@ -941,6 +944,9 @@ IMPORTANT:
 
         // Clean up markdown delimiters
       responseText = responseText.replace(/^```(?:xml)?\s*/i, '').replace(/```\s*$/i, '');
+
+      // Strip <think>...</think> blocks (emitted by reasoning models like MiniMax-M2.7)
+      responseText = responseText.replace(/<think>[\s\S]*?<\/think>/gi, '').trim();
 
       // Extract wiki structure from response
       const xmlMatch = responseText.match(/<wiki_structure>[\s\S]*?<\/wiki_structure>/m);
@@ -1529,7 +1535,8 @@ IMPORTANT:
           repo_url: repoUrl,
           type: effectiveRepoInfo.type,
           pages: pagesToExport,
-          format
+          format,
+          wiki_structure: wikiStructure
         })
       });
 

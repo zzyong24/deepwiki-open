@@ -1,6 +1,29 @@
 {
-  "default_provider": "google",
+  "default_provider": "minimax",
   "providers": {
+    "minimax": {
+      "client_class": "MinimaxClient",
+      "default_model": "MiniMax-M2.7",
+      "supportsCustomModel": true,
+      "models": {
+        "MiniMax-M2.7": {
+          "temperature": 0.7,
+          "top_p": 0.8
+        },
+        "MiniMax-Text-01": {
+          "temperature": 0.7,
+          "top_p": 0.8
+        },
+        "abab6.5s-chat": {
+          "temperature": 0.7,
+          "top_p": 0.8
+        },
+        "abab6.5-chat": {
+          "temperature": 0.7,
+          "top_p": 0.8
+        }
+      }
+    },
     "dashscope": {
       "default_model": "qwen-plus",
       "supportsCustomModel": true,

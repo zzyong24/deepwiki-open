@@ -3,11 +3,12 @@
 import React, { useState, useEffect } from 'react';
 import { useRouter } from 'next/navigation';
 import Link from 'next/link';
-import { FaWikipediaW, FaGithub, FaCoffee, FaTwitter } from 'react-icons/fa';
+import { FaWikipediaW, FaGithub, FaCoffee, FaTwitter, FaFolder, FaLayerGroup } from 'react-icons/fa';
 import ThemeToggle from '@/components/theme-toggle';
 import Mermaid from '../components/Mermaid';
 import ConfigurationModal from '@/components/ConfigurationModal';
 import ProcessedProjects from '@/components/ProcessedProjects';
+import BatchWikiQueue from '@/components/BatchWikiQueue';
 import { extractUrlPath, extractUrlDomain } from '@/utils/urlDecoder';
 import { useProcessedProjects } from '@/hooks/useProcessedProjects';
 
@@ -139,6 +140,7 @@ export default function Home() {
   const [error, setError] = useState<string | null>(null);
   const [isSubmitting, setIsSubmitting] = useState(false);
   const [selectedLanguage, setSelectedLanguage] = useState<string>(language);
+  const [batchMode, setBatchMode] = useState(false);
 
   // Authentication state
   const [authRequired, setAuthRequired] = useState<boolean>(false);
@@ -414,30 +416,74 @@ export default function Home() {
           </div>
 
           <form onSubmit={handleFormSubmit} className="flex flex-col gap-3 w-full max-w-3xl">
-            {/* Repository URL input and submit button */}
-            <div className="flex flex-col sm:flex-row gap-2">
-              <div className="relative flex-1">
-                <input
-                  type="text"
-                  value={repositoryInput}
-                  onChange={handleRepositoryInputChange}
-                  placeholder={t('form.repoPlaceholder') || "owner/repo, GitHub/GitLab/BitBucket URL, or local folder path"}
-                  className="input-japanese block w-full pl-10 pr-3 py-2.5 border-[var(--border-color)] rounded-lg bg-transparent text-[var(--foreground)] focus:outline-none focus:border-[var(--accent-primary)]"
-                />
-                {error && (
-                  <div className="text-[var(--highlight)] text-xs mt-1">
-                    {error}
-                  </div>
-                )}
-              </div>
+            {/* Mode toggle */}
+            <div className="flex items-center gap-2">
               <button
-                type="submit"
-                className="btn-japanese px-6 py-2.5 rounded-lg disabled:opacity-50 disabled:cursor-not-allowed"
-                disabled={isSubmitting}
+                type="button"
+                onClick={() => setBatchMode(false)}
+                className={`px-3 py-1 text-xs rounded-full border transition-colors ${!batchMode ? 'border-[var(--accent-primary)] bg-[var(--accent-primary)]/10 text-[var(--accent-primary)]' : 'border-[var(--border-color)] text-[var(--muted)] hover:border-[var(--accent-primary)]/50'}`}
               >
-                {isSubmitting ? t('common.processing') : t('common.generateWiki')}
+                单个生成
+              </button>
+              <button
+                type="button"
+                onClick={() => setBatchMode(true)}
+                className={`px-3 py-1 text-xs rounded-full border transition-colors flex items-center gap-1.5 ${batchMode ? 'border-[var(--accent-primary)] bg-[var(--accent-primary)]/10 text-[var(--accent-primary)]' : 'border-[var(--border-color)] text-[var(--muted)] hover:border-[var(--accent-primary)]/50'}`}
+              >
+                <FaLayerGroup className="text-[10px]" /> 批量生成
               </button>
             </div>
+
+            {batchMode ? (
+              <BatchWikiQueue
+                provider={provider}
+                model={model}
+                language={selectedLanguage}
+                isComprehensiveView={isComprehensiveView}
+              />
+            ) : (
+              <>
+                {/* Repository URL input and submit button */}
+                <div className="flex flex-col sm:flex-row gap-2">
+                  <div className="relative flex-1">
+                    <div className="absolute inset-y-0 left-3 flex items-center pointer-events-none text-[var(--muted)]">
+                      {repositoryInput.startsWith('/') || /^[a-zA-Z]:\\/.test(repositoryInput)
+                        ? <FaFolder className="text-[var(--accent-primary)]" />
+                        : <svg xmlns="http://www.w3.org/2000/svg" className="h-4 w-4" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                            <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M13.828 10.172a4 4 0 00-5.656 0l-4 4a4 4 0 105.656 5.656l1.102-1.101m-.758-4.899a4 4 0 005.656 0l4-4a4 4 0 00-5.656-5.656l-1.1 1.1" />
+                          </svg>
+                      }
+                    </div>
+                    <input
+                      type="text"
+                      value={repositoryInput}
+                      onChange={handleRepositoryInputChange}
+                      placeholder={t('form.repoPlaceholder') || "owner/repo, GitHub/GitLab/BitBucket URL, or local folder path"}
+                      className="input-japanese block w-full pl-10 pr-3 py-2.5 border-[var(--border-color)] rounded-lg bg-transparent text-[var(--foreground)] focus:outline-none focus:border-[var(--accent-primary)]"
+                    />
+                    {error && (
+                      <div className="text-[var(--highlight)] text-xs mt-1">
+                        {error}
+                      </div>
+                    )}
+                  </div>
+                  <button
+                    type="submit"
+                    className="btn-japanese px-6 py-2.5 rounded-lg disabled:opacity-50 disabled:cursor-not-allowed"
+                    disabled={isSubmitting}
+                  >
+                    {isSubmitting ? t('common.processing') : t('common.generateWiki')}
+                  </button>
+                </div>
+                {/* Local path hint */}
+                {(repositoryInput.startsWith('/') || /^[a-zA-Z]:\\/.test(repositoryInput)) && (
+                  <div className="flex items-center gap-1.5 text-xs text-[var(--accent-primary)]">
+                    <FaFolder className="flex-shrink-0" />
+                    <span>{t('home.localRepoLabel') || 'Local Repository'} — {repositoryInput}</span>
+                  </div>
+                )}
+              </>
+            )}
           </form>
 
           {/* Configuration Modal */}
@@ -558,6 +604,21 @@ export default function Home() {
               <div
                 className="bg-[var(--background)]/70 p-3 rounded border border-[var(--border-color)] font-mono overflow-x-hidden whitespace-nowrap"
               >https://bitbucket.org/atlassian/atlaskit
+              </div>
+              {/* Local repo examples */}
+              <div className="flex items-center gap-2 mt-1">
+                <FaFolder className="text-[var(--accent-primary)] flex-shrink-0" />
+                <span className="text-[var(--accent-primary)] font-semibold not-italic">
+                  {t('home.localRepoLabel') || 'Local Repository'}
+                </span>
+              </div>
+              <div
+                className="bg-[var(--background)]/70 p-3 rounded border border-[var(--accent-primary)]/30 font-mono overflow-x-hidden whitespace-nowrap text-[var(--foreground)]"
+              >/Users/yourname/projects/my-app
+              </div>
+              <div
+                className="bg-[var(--background)]/70 p-3 rounded border border-[var(--accent-primary)]/30 font-mono overflow-x-hidden whitespace-nowrap text-[var(--foreground)]"
+              >C:\Users\yourname\projects\my-app
               </div>
             </div>
           </div>

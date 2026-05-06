@@ -23,6 +23,7 @@ from api.openai_client import OpenAIClient
 from api.openrouter_client import OpenRouterClient
 from api.azureai_client import AzureAIClient
 from api.dashscope_client import DashscopeClient
+from api.minimax_client import MinimaxClient
 from api.rag import RAG
 
 # Configure logging
@@ -60,6 +61,85 @@ class ChatCompletionRequest(BaseModel):
     included_dirs: Optional[str] = Field(None, description="Comma-separated list of directories to include exclusively")
     included_files: Optional[str] = Field(None, description="Comma-separated list of file patterns to include exclusively")
 
+
+# ---------------------------------------------------------------------------
+# Local repo helpers (bypass RAG/embedding for local paths)
+# ---------------------------------------------------------------------------
+
+_LOCAL_EXCLUDED_DIRS = {
+    '.git', '.venv', 'venv', 'node_modules', '__pycache__',
+    '.idea', '.vs', 'vendor', 'dist', 'build', '.next', 'coverage',
+}
+_LOCAL_EXCLUDED_EXTS = {'.lock', '.sum', '.pb', '.pb.go', '.pyc', '.pyo'}
+_LOCAL_EXCLUDED_FILES = {'go.sum', 'yarn.lock', 'package-lock.json', '.DS_Store'}
+
+
+def _scan_local_repo(repo_path: str, max_files: int = 200) -> tuple[list[str], str]:
+    """Walk a local repo and return (sorted_file_list, readme_content)."""
+    files: list[str] = []
+    readme = ""
+    for root, dirs, filenames in os.walk(repo_path):
+        dirs[:] = sorted(
+            d for d in dirs
+            if d not in _LOCAL_EXCLUDED_DIRS and not d.startswith('.')
+        )
+        for name in sorted(filenames):
+            if name.startswith('.') or name in _LOCAL_EXCLUDED_FILES:
+                continue
+            _, ext = os.path.splitext(name)
+            if ext in _LOCAL_EXCLUDED_EXTS:
+                continue
+            rel_dir = os.path.relpath(root, repo_path)
+            rel_file = os.path.join(rel_dir, name) if rel_dir != '.' else name
+            files.append(rel_file)
+            if name.lower() == 'readme.md' and not readme:
+                try:
+                    with open(os.path.join(root, name), 'r', encoding='utf-8', errors='replace') as f:
+                        readme = f.read()
+                except Exception:
+                    pass
+            if len(files) >= max_files:
+                break
+        if len(files) >= max_files:
+            break
+    return sorted(files), readme
+
+
+def _read_local_file(repo_path: str, rel_path: str, max_chars: int = 10000) -> str:
+    """Read a single file from the local repo, truncating if needed."""
+    full = os.path.join(repo_path, rel_path)
+    if not os.path.exists(full):
+        return f"[File not found: {rel_path}]"
+    try:
+        with open(full, 'r', encoding='utf-8', errors='replace') as f:
+            content = f.read()
+        if len(content) > max_chars:
+            content = content[:max_chars] + "\n... [truncated]"
+        return content
+    except Exception as e:
+        return f"[Cannot read file: {e}]"
+
+
+def _build_local_context(repo_path: str, file_list: list[str], max_files: int = 15) -> str:
+    """Read up to max_files files and build a context string."""
+    # Prioritise key files: source code first, config/docs second
+    priority_exts = {'.py', '.ts', '.tsx', '.js', '.jsx', '.go', '.java', '.rs', '.rb', '.cs'}
+    secondary_exts = {'.json', '.yaml', '.yml', '.toml', '.md', '.txt', '.sh'}
+
+    priority = [f for f in file_list if os.path.splitext(f)[1] in priority_exts]
+    secondary = [f for f in file_list if os.path.splitext(f)[1] in secondary_exts]
+    rest = [f for f in file_list if f not in priority and f not in secondary]
+
+    selected = (priority + secondary + rest)[:max_files]
+
+    parts = []
+    for rel_path in selected:
+        content = _read_local_file(repo_path, rel_path)
+        parts.append(f"## File: {rel_path}\n```\n{content}\n```")
+
+    return "\n\n".join(parts)
+
+
 async def handle_websocket_chat(websocket: WebSocket):
     """
     Handle WebSocket connection for chat completions.
@@ -83,51 +163,66 @@ async def handle_websocket_chat(websocket: WebSocket):
                     logger.warning(f"Request exceeds recommended token limit ({tokens} > 7500)")
                     input_too_large = True
 
-        # Create a new RAG instance for this request
-        try:
-            request_rag = RAG(provider=request.provider, model=request.model)
+        # Determine if this is a local repo request (bypass RAG/embedding)
+        local_repo_mode = (request.type == 'local')
+        request_rag = None
 
-            # Extract custom file filter parameters if provided
-            excluded_dirs = None
-            excluded_files = None
-            included_dirs = None
-            included_files = None
-
-            if request.excluded_dirs:
-                excluded_dirs = [unquote(dir_path) for dir_path in request.excluded_dirs.split('\n') if dir_path.strip()]
-                logger.info(f"Using custom excluded directories: {excluded_dirs}")
-            if request.excluded_files:
-                excluded_files = [unquote(file_pattern) for file_pattern in request.excluded_files.split('\n') if file_pattern.strip()]
-                logger.info(f"Using custom excluded files: {excluded_files}")
-            if request.included_dirs:
-                included_dirs = [unquote(dir_path) for dir_path in request.included_dirs.split('\n') if dir_path.strip()]
-                logger.info(f"Using custom included directories: {included_dirs}")
-            if request.included_files:
-                included_files = [unquote(file_pattern) for file_pattern in request.included_files.split('\n') if file_pattern.strip()]
-                logger.info(f"Using custom included files: {included_files}")
-
-            request_rag.prepare_retriever(request.repo_url, request.type, request.token, excluded_dirs, excluded_files, included_dirs, included_files)
-            logger.info(f"Retriever prepared for {request.repo_url}")
-        except ValueError as e:
-            if "No valid documents with embeddings found" in str(e):
-                logger.error(f"No valid embeddings found: {str(e)}")
-                await websocket.send_text("Error: No valid document embeddings found. This may be due to embedding size inconsistencies or API errors during document processing. Please try again or check your repository content.")
+        if local_repo_mode:
+            # --- Local repo path: read files directly, skip embedding entirely ---
+            local_path = request.repo_url
+            logger.info(f"Local repo mode: reading files from {local_path}")
+            if not os.path.isdir(local_path):
+                await websocket.send_text(f"Error: Local path not found or not a directory: {local_path}")
                 await websocket.close()
                 return
-            else:
-                logger.error(f"ValueError preparing retriever: {str(e)}")
-                await websocket.send_text(f"Error preparing retriever: {str(e)}")
+            local_file_list, _readme = _scan_local_repo(local_path)
+            logger.info(f"Local repo: found {len(local_file_list)} files")
+        else:
+            # --- Remote repo path: use RAG/embedding pipeline ---
+            try:
+                request_rag = RAG(provider=request.provider, model=request.model)
+
+                # Extract custom file filter parameters if provided
+                excluded_dirs = None
+                excluded_files = None
+                included_dirs = None
+                included_files = None
+
+                if request.excluded_dirs:
+                    excluded_dirs = [unquote(dir_path) for dir_path in request.excluded_dirs.split('\n') if dir_path.strip()]
+                    logger.info(f"Using custom excluded directories: {excluded_dirs}")
+                if request.excluded_files:
+                    excluded_files = [unquote(file_pattern) for file_pattern in request.excluded_files.split('\n') if file_pattern.strip()]
+                    logger.info(f"Using custom excluded files: {excluded_files}")
+                if request.included_dirs:
+                    included_dirs = [unquote(dir_path) for dir_path in request.included_dirs.split('\n') if dir_path.strip()]
+                    logger.info(f"Using custom included directories: {included_dirs}")
+                if request.included_files:
+                    included_files = [unquote(file_pattern) for file_pattern in request.included_files.split('\n') if file_pattern.strip()]
+                    logger.info(f"Using custom included files: {included_files}")
+
+                request_rag.prepare_retriever(request.repo_url, request.type, request.token, excluded_dirs, excluded_files, included_dirs, included_files)
+                logger.info(f"Retriever prepared for {request.repo_url}")
+            except ValueError as e:
+                if "No valid documents with embeddings found" in str(e):
+                    logger.error(f"No valid embeddings found: {str(e)}")
+                    await websocket.send_text("Error: No valid document embeddings found. This may be due to embedding size inconsistencies or API errors during document processing. Please try again or check your repository content.")
+                    await websocket.close()
+                    return
+                else:
+                    logger.error(f"ValueError preparing retriever: {str(e)}")
+                    await websocket.send_text(f"Error preparing retriever: {str(e)}")
+                    await websocket.close()
+                    return
+            except Exception as e:
+                logger.error(f"Error preparing retriever: {str(e)}")
+                # Check for specific embedding-related errors
+                if "All embeddings should be of the same size" in str(e):
+                    await websocket.send_text("Error: Inconsistent embedding sizes detected. Some documents may have failed to embed properly. Please try again.")
+                else:
+                    await websocket.send_text(f"Error preparing retriever: {str(e)}")
                 await websocket.close()
                 return
-        except Exception as e:
-            logger.error(f"Error preparing retriever: {str(e)}")
-            # Check for specific embedding-related errors
-            if "All embeddings should be of the same size" in str(e):
-                await websocket.send_text("Error: Inconsistent embedding sizes detected. Some documents may have failed to embed properly. Please try again.")
-            else:
-                await websocket.send_text(f"Error preparing retriever: {str(e)}")
-            await websocket.close()
-            return
 
         # Validate request
         if not request.messages or len(request.messages) == 0:
@@ -148,10 +243,11 @@ async def handle_websocket_chat(websocket: WebSocket):
                 assistant_msg = request.messages[i + 1]
 
                 if user_msg.role == "user" and assistant_msg.role == "assistant":
-                    request_rag.memory.add_dialog_turn(
-                        user_query=user_msg.content,
-                        assistant_response=assistant_msg.content
-                    )
+                    if not local_repo_mode and request_rag is not None:
+                        request_rag.memory.add_dialog_turn(
+                            user_query=user_msg.content,
+                            assistant_response=assistant_msg.content
+                        )
 
         # Check if this is a Deep Research request
         is_deep_research = False
@@ -193,7 +289,12 @@ async def handle_websocket_chat(websocket: WebSocket):
         context_text = ""
         retrieved_documents = None
 
-        if not input_too_large:
+        if local_repo_mode:
+            # Build context directly from local files — no embedding needed
+            if not input_too_large:
+                context_text = _build_local_context(request.repo_url, local_file_list)
+                logger.info(f"Local context built: {len(context_text)} chars from {len(local_file_list)} files")
+        elif not input_too_large:
             try:
                 # If filePath exists, modify the query for RAG to focus on the file
                 rag_query = query
@@ -410,9 +511,10 @@ This file contains...
 
         # Format conversation history
         conversation_history = ""
-        for turn_id, turn in request_rag.memory().items():
-            if not isinstance(turn_id, int) and hasattr(turn, 'user_query') and hasattr(turn, 'assistant_response'):
-                conversation_history += f"<turn>\n<user>{turn.user_query.query_str}</user>\n<assistant>{turn.assistant_response.response_str}</assistant>\n</turn>\n"
+        if not local_repo_mode and request_rag is not None:
+            for turn_id, turn in request_rag.memory().items():
+                if not isinstance(turn_id, int) and hasattr(turn, 'user_query') and hasattr(turn, 'assistant_response'):
+                    conversation_history += f"<turn>\n<user>{turn.user_query.query_str}</user>\n<assistant>{turn.assistant_response.response_str}</assistant>\n</turn>\n"
 
         # Create the prompt with context
         prompt = f"/no_think {system_prompt}\n\n"
@@ -554,6 +656,22 @@ This file contains...
                 "temperature": model_config["temperature"],
                 "top_p": model_config["top_p"]
             }
+
+            api_kwargs = model.convert_inputs_to_api_kwargs(
+                input=prompt,
+                model_kwargs=model_kwargs,
+                model_type=ModelType.LLM
+            )
+        elif request.provider == "minimax":
+            logger.info(f"Using MiniMax with model: {request.model}")
+            model = MinimaxClient()
+            model_kwargs = {
+                "model": request.model,
+                "stream": True,
+                "temperature": model_config["temperature"],
+            }
+            if "top_p" in model_config:
+                model_kwargs["top_p"] = model_config["top_p"]
 
             api_kwargs = model.convert_inputs_to_api_kwargs(
                 input=prompt,
@@ -703,6 +821,54 @@ This file contains...
                     )
                     await websocket.send_text(error_msg)
                     # Close the WebSocket connection after sending the error message
+                    await websocket.close()
+            elif request.provider == "minimax":
+                try:
+                    logger.info("Making MiniMax API call")
+                    response = await model.acall(api_kwargs=api_kwargs, model_type=ModelType.LLM)
+                    # MiniMax-M2.7 emits <think>...</think> reasoning blocks before real content.
+                    # Buffer and discard those so the client only sees final output.
+                    think_buffer = ""
+                    in_think = False
+                    async for chunk in response:
+                        choices = getattr(chunk, "choices", [])
+                        if len(choices) > 0:
+                            delta = getattr(choices[0], "delta", None)
+                            if delta is not None:
+                                text = getattr(delta, "content", None)
+                                if text is None:
+                                    continue
+                                if not in_think and not think_buffer:
+                                    # Fast path: no think block yet
+                                    if "<think>" in text:
+                                        in_think = True
+                                        before, _, rest = text.partition("<think>")
+                                        if before:
+                                            await websocket.send_text(before)
+                                        think_buffer = rest
+                                        if "</think>" in think_buffer:
+                                            _, _, after = think_buffer.partition("</think>")
+                                            think_buffer = ""
+                                            in_think = False
+                                            if after:
+                                                await websocket.send_text(after)
+                                    else:
+                                        await websocket.send_text(text)
+                                elif in_think:
+                                    think_buffer += text
+                                    if "</think>" in think_buffer:
+                                        _, _, after = think_buffer.partition("</think>")
+                                        think_buffer = ""
+                                        in_think = False
+                                        if after:
+                                            await websocket.send_text(after)
+                                else:
+                                    await websocket.send_text(text)
+                    await websocket.close()
+                except Exception as e_minimax:
+                    logger.error(f"Error with MiniMax API: {str(e_minimax)}")
+                    error_msg = f"\nError with MiniMax API: {str(e_minimax)}\n\nPlease check that you have set the MINIMAX_API_KEY and MINIMAX_BASE_URL environment variables."
+                    await websocket.send_text(error_msg)
                     await websocket.close()
             else:
                 # Google Generative AI (default provider)
@@ -873,6 +1039,62 @@ This file contains...
                                 f"\nError with Dashscope API fallback: {str(e_fallback)}\n\n"
                                 "Please check that you have set the DASHSCOPE_API_KEY (and optionally "
                                 "DASHSCOPE_WORKSPACE_ID) environment variables with valid values."
+                            )
+                            await websocket.send_text(error_msg)
+                    elif request.provider == "minimax":
+                        try:
+                            fallback_api_kwargs = model.convert_inputs_to_api_kwargs(
+                                input=simplified_prompt,
+                                model_kwargs=model_kwargs,
+                                model_type=ModelType.LLM,
+                            )
+
+                            logger.info("Making fallback MiniMax API call")
+                            fallback_response = await model.acall(
+                                api_kwargs=fallback_api_kwargs, model_type=ModelType.LLM
+                            )
+
+                            fb_think_buf = ""
+                            fb_in_think = False
+                            async for chunk in fallback_response:
+                                choices = getattr(chunk, "choices", [])
+                                if len(choices) > 0:
+                                    delta = getattr(choices[0], "delta", None)
+                                    if delta is not None:
+                                        text = getattr(delta, "content", None)
+                                        if text is None:
+                                            continue
+                                        if not fb_in_think and not fb_think_buf:
+                                            if "<think>" in text:
+                                                fb_in_think = True
+                                                before, _, rest = text.partition("<think>")
+                                                if before:
+                                                    await websocket.send_text(before)
+                                                fb_think_buf = rest
+                                                if "</think>" in fb_think_buf:
+                                                    _, _, after = fb_think_buf.partition("</think>")
+                                                    fb_think_buf = ""
+                                                    fb_in_think = False
+                                                    if after:
+                                                        await websocket.send_text(after)
+                                            else:
+                                                await websocket.send_text(text)
+                                        elif fb_in_think:
+                                            fb_think_buf += text
+                                            if "</think>" in fb_think_buf:
+                                                _, _, after = fb_think_buf.partition("</think>")
+                                                fb_think_buf = ""
+                                                fb_in_think = False
+                                                if after:
+                                                    await websocket.send_text(after)
+                                        else:
+                                            await websocket.send_text(text)
+                        except Exception as e_fallback:
+                            logger.error(f"Error with MiniMax API fallback: {str(e_fallback)}")
+                            error_msg = (
+                                f"\nError with MiniMax API fallback: {str(e_fallback)}\n\n"
+                                "Please check that you have set the MINIMAX_API_KEY and MINIMAX_BASE_URL "
+                                "environment variables with valid values."
                             )
                             await websocket.send_text(error_msg)
                     else:

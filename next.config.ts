@@ -48,6 +48,10 @@ const nextConfig: NextConfig = {
         destination: `${TARGET_SERVER_BASE_URL}/api/wiki_cache`,
       },
       {
+        source: '/batch/:path*',
+        destination: `${TARGET_SERVER_BASE_URL}/batch/:path*`,
+      },
+      {
         source: '/local_repo/structure',
         destination: `${TARGET_SERVER_BASE_URL}/local_repo/structure`,
       },
