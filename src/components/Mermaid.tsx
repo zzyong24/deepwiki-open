@@ -303,8 +303,49 @@ const FullScreenModal: React.FC<{
   );
 };
 
-const Mermaid: React.FC<MermaidProps> = ({ chart, className = '', zoomingEnabled = false }) => {
-  const [svg, setSvg] = useState<string>('');
+/**
+ * Fix common LLM-generated Mermaid syntax issues before rendering.
+ */
+function sanitizeMermaid(chart: string): string {
+  const lines = chart.split('\n');
+  const firstLine = lines[0]?.trim().toLowerCase() ?? '';
+  const isSequence = firstLine.startsWith('sequencediagram');
+  const isFlowchart = firstLine.startsWith('flowchart') || firstLine.startsWith('graph');
+
+  return lines.map((line, idx) => {
+    if (idx === 0) return line; // preserve diagram type declaration
+
+    // ── sequenceDiagram fixes ──────────────────────────────────────
+    if (isSequence) {
+      // Fix: message labels starting with a digit get parsed as autonumber
+      // e.g.  "A->>B: 1 Success" → "A->>B: Resp 1 Success"
+      // Pattern: arrow followed by ": <digit>"
+      line = line.replace(/(->?>?>?)\s*:\s*(\d)/, '$1: #$2');
+      // Also handle "note" lines with digit-starting text
+      line = line.replace(/(note\s+(?:over|left of|right of)\s+[^:]+):\s*(\d)/i, '$1: #$2');
+    }
+
+    // ── flowchart / graph fixes ────────────────────────────────────
+    if (isFlowchart) {
+      // Fix: diamond node labels containing == (comparison operators)
+      // e.g.  B{format == "markdown"?}  →  B{"format == 'markdown'?"}
+      line = line.replace(/\{([^}]*==+[^}]*)\}/g, (_, inner) => {
+        // wrap in quotes if not already quoted
+        const cleaned = inner.replace(/"/g, "'");
+        return `{"${cleaned}"}`;
+      });
+      // Fix: node labels containing " == " with double-equals in square brackets too
+      line = line.replace(/\[([^\]]*==+[^\]]*)\]/g, (_, inner) => {
+        const cleaned = inner.replace(/"/g, "'");
+        return `["${cleaned}"]`;
+      });
+    }
+
+    return line;
+  }).join('\n');
+}
+
+const Mermaid: React.FC<MermaidProps> = ({ chart, className = '', zoomingEnabled = false }) => {  const [svg, setSvg] = useState<string>('');
   const [error, setError] = useState<string | null>(null);
   const [isFullscreen, setIsFullscreen] = useState(false);
   const mermaidRef = useRef<HTMLDivElement>(null);
@@ -366,7 +407,7 @@ const Mermaid: React.FC<MermaidProps> = ({ chart, className = '', zoomingEnabled
         setSvg('');
 
         // Render the chart directly without preprocessing
-        const { svg: renderedSvg } = await mermaid.render(idRef.current, chart);
+        const { svg: renderedSvg } = await mermaid.render(idRef.current, sanitizeMermaid(chart));
 
         if (!isMounted) return;
 
